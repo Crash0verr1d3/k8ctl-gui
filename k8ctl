@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""k8ctl - backlight control for stock-firmware Keychron keyboards on Linux.
+
+Supports the Keychron K8 (USB 05ac:0250, confirmed working) and K3 v2
+(05ac:024f, the device the protocol was originally documented on).
+
+Protocol derived from two GPL implementations:
+  - OpenRGB Controllers/KeychronKeyboardController (GPL-2.0-or-later)
+  - github.com/mishamyrt/keychron-go (GPL-3.0)
+This script is accordingly GPL-3.0.
+
+Transport: 64-byte HID feature reports (report ID 0) on the keyboard's
+control hidraw interface, 10 ms between packets. Use the USB cable, not
+Bluetooth. Needs access to /dev/hidraw* (root, or the udev rule shown in
+--help).
+"""
+
+import argparse
+import array
+import fcntl
+import glob
+import os
+import sys
+import time
+
+SUPPORTED = ("000005AC:00000250",   # K8
+             "000005AC:0000024F")   # K3 v2
+PACKET_LEN = 64
+PAGE_LEN = 16
+HEADER = 0x04
+CRC_L, CRC_H = 0xAA, 0x55
+
+CMD_END = 0x02
+CMD_INFO = 0x05
+CMD_WRITE_EFFECTS = 0x13
+CMD_CUSTOM_ON = 0x18
+CMD_CUSTOM_OFF = 0x19
+CMD_APPLY = 0xF0
+EFFECT_PAGES = 0x12  # 18
+
+MODES = {
+    "custom": 0x00,
+    "static": 0x01,
+    "keystroke-light-up": 0x02,
+    "keystroke-dim": 0x03,
+    "sparkle": 0x04,
+    "rain": 0x05,
+    "random-colors": 0x06,
+    "breathing": 0x07,
+    "spectrum-cycle": 0x08,
+    "ring-gradient": 0x09,
+    "vertical-gradient": 0x0A,
+    "horizontal-wave": 0x0B,
+    "around-edges": 0x0C,
+    "keystroke-horizontal-lines": 0x0D,
+    "keystroke-tilted-lines": 0x0E,
+    "keystroke-ripples": 0x0F,
+    "sequence": 0x10,
+    "wave-line": 0x11,
+    "tilted-lines": 0x12,
+    "back-and-forth": 0x13,
+    "off": 0x80,
+}
+# The 20 effect-page slots, in on-wire order (custom has no page of its own).
+PAGE_SLOTS = list(range(0x01, 0x14)) + [0x80]
+
+DIRECTIONS = {"lr": 0, "rl": 1, "du": 2, "ud": 3}
+
+
+def _ioc(dir_, nr, size):
+    return (dir_ << 30) | (size << 16) | (ord("H") << 8) | nr
+
+
+def hidiocsfeature(n):
+    return _ioc(3, 0x06, n)
+
+
+def hidiocgfeature(n):
+    return _ioc(3, 0x07, n)
+
+
+class Keyboard:
+    def __init__(self, path, verbose=False):
+        self.path = path
+        self.verbose = verbose
+        self.fd = os.open(path, os.O_RDWR)
+
+    def close(self):
+        os.close(self.fd)
+
+    def send(self, data):
+        buf = array.array("B", bytes([0x00]) + bytes(data).ljust(PACKET_LEN, b"\x00"))
+        if self.verbose:
+            print(f"  -> {bytes(buf[1:17]).hex(' ')} ...")
+        fcntl.ioctl(self.fd, hidiocsfeature(len(buf)), buf, True)
+        time.sleep(0.01)
+
+    def read(self):
+        buf = array.array("B", [0x00] * (PACKET_LEN + 1))
+        fcntl.ioctl(self.fd, hidiocgfeature(len(buf)), buf, True)
+        data = bytes(buf)
+        if self.verbose:
+            print(f"  <- {data[:20].hex(' ')} ...")
+        time.sleep(0.01)
+        return data
+
+    def cmd(self, *payload, expect_ack=False):
+        self.send(bytes([HEADER, *payload]))
+        resp = self.read()
+        if expect_ack:
+            # ACK byte 0x01 (NACK 0xFF) is at data offset 3; depending on
+            # how the kernel returns unnumbered reports it lands at buf[3]
+            # or buf[4], so check both.
+            window = resp[3:5]
+            if 0xFF in window:
+                raise RuntimeError(f"keyboard NACKed command {payload[0]:#04x}")
+            if 0x01 not in window:
+                print(f"warning: no clear ACK for {payload[0]:#04x}: "
+                      f"{resp[:8].hex(' ')}", file=sys.stderr)
+        return resp
+
+
+def find_nodes():
+    nodes = []
+    for uevent in sorted(glob.glob("/sys/class/hidraw/hidraw*/device/uevent")):
+        info = open(uevent).read()
+        if any(vp in info for vp in SUPPORTED) and "Keychron" in info:
+            nodes.append("/dev/" + uevent.split("/")[4])
+    return nodes
+
+
+def open_keyboard(verbose=False):
+    """Return a Keyboard on the control interface, or raise RuntimeError."""
+    nodes = find_nodes()
+    if not nodes:
+        raise RuntimeError(
+            "No supported Keychron keyboard found. Is it plugged in via USB?")
+    # The control interface is the one that accepts feature reports; probe
+    # each candidate with GET_BASIC_INFO.
+    last_err = None
+    for path in reversed(nodes):
+        try:
+            kb = Keyboard(path, verbose)
+        except PermissionError:
+            raise RuntimeError(
+                f"Permission denied on {path}. Run with sudo, or install the "
+                "udev rule (see k8ctl --help).") from None
+        try:
+            kb.cmd(CMD_INFO)
+            if verbose:
+                print(f"using {path}")
+            return kb
+        except OSError as e:
+            last_err = e
+            kb.close()
+    raise RuntimeError(
+        f"No interface on {nodes} accepted feature reports ({last_err}).")
+
+
+def build_page(mode_value, color, brightness, speed, direction, random_color):
+    page = bytearray(PAGE_LEN)
+    page[0] = mode_value
+    if random_color:
+        page[8] = 1
+    else:
+        page[1], page[2], page[3] = color
+    page[9] = brightness
+    page[10] = speed
+    page[11] = direction
+    page[14], page[15] = CRC_L, CRC_H
+    return bytes(page)
+
+
+def apply_settings(kb, mode_value, color, brightness, speed, direction,
+                   random_color):
+    is_custom = mode_value == MODES["custom"]
+    kb.cmd(CMD_CUSTOM_ON if is_custom else CMD_CUSTOM_OFF)
+    try:
+        kb.cmd(CMD_WRITE_EFFECTS, 0, 0, 0, 0, 0, 0, EFFECT_PAGES,
+               expect_ack=True)
+    except RuntimeError:
+        # Keyboard refused the write; close the transaction so it is not
+        # left waiting for effect pages, then report.
+        kb.cmd(CMD_END)
+        raise
+
+    # 5 packets x 4 effect pages: store the same settings under every mode,
+    # so cycling modes with the lightbulb key keeps your color/brightness.
+    selected = None
+    for i in range(5):
+        packet = bytearray(PACKET_LEN)
+        for j in range(4):
+            value = PAGE_SLOTS[i * 4 + j]
+            page = build_page(value, color, brightness, speed, direction,
+                              random_color)
+            packet[j * PAGE_LEN:(j + 1) * PAGE_LEN] = page
+            if value == mode_value or (value == 0x80 and is_custom):
+                selected = page
+        kb.send(packet)
+
+    for _ in range(3):
+        kb.send(bytes(PACKET_LEN))
+
+    # Per-LED color buffer: 144 slots of [0x80, R, G, B].
+    color_buf = bytearray(576)
+    r, g, b = color if is_custom and not random_color else (0, 0, 0)
+    for i in range(0, 576, 4):
+        color_buf[i], color_buf[i + 1], color_buf[i + 2], color_buf[i + 3] = \
+            0x80, r, g, b
+    for p in range(9):
+        kb.send(color_buf[p * PACKET_LEN:(p + 1) * PACKET_LEN])
+
+    kb.send(selected)                      # active mode page, no header
+    kb.cmd(CMD_END, expect_ack=True)
+    kb.cmd(CMD_APPLY)                      # 04 F0, no read
+
+
+def do_set(mode_name, color, brightness, speed, direction, random_color,
+           verbose=False):
+    kb = open_keyboard(verbose)
+    try:
+        apply_settings(kb, MODES[mode_name], color, brightness, speed,
+                       direction, random_color)
+    finally:
+        kb.close()
+
+
+def parse_color(s):
+    s = s.lstrip("#")
+    if len(s) != 6:
+        raise argparse.ArgumentTypeError("color must be RRGGBB hex")
+    return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+
+
+# ----------------------------------------------------------------- GUI ---
+
+GUI_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>K8 Control</title>
+<style>
+  :root {
+    --bg: #f4f4f6; --card: #ffffff; --text: #1a1a22; --muted: #6b6b7a;
+    --accent: #e0417c; --border: #dddde4; --btn: #ececf1; --btn-on: #e0417c;
+    --btn-on-text: #fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141419; --card: #1e1e26; --text: #ececf1; --muted: #9a9aab;
+      --border: #2e2e3a; --btn: #2a2a35;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, sans-serif; display: flex; justify-content: center;
+  }
+  main { width: 100%; max-width: 560px; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 8px 0 2px; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+  section {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px; margin-bottom: 14px;
+  }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+       color: var(--muted); margin: 0 0 10px; }
+  .modes { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; }
+  .modes button {
+    padding: 8px 6px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--btn); color: var(--text); cursor: pointer; font-size: 13px;
+  }
+  .modes button.on { background: var(--btn-on); color: var(--btn-on-text);
+    border-color: var(--btn-on); }
+  .row { display: flex; align-items: center; gap: 12px; margin: 10px 0; }
+  .row label { width: 90px; flex-shrink: 0; font-size: 14px; }
+  .row input[type=range] { flex: 1; accent-color: var(--accent); }
+  .row output { width: 28px; text-align: right; font-variant-numeric: tabular-nums; }
+  input[type=color] { width: 56px; height: 36px; border: 1px solid var(--border);
+    border-radius: 8px; background: var(--btn); padding: 2px; cursor: pointer; }
+  select { background: var(--btn); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; font-size: 14px; }
+  .actions { display: flex; gap: 10px; }
+  .actions button {
+    flex: 1; padding: 12px; border-radius: 10px; border: none; cursor: pointer;
+    font-size: 15px; font-weight: 600;
+  }
+  #apply { background: var(--accent); color: #fff; }
+  #off { background: var(--btn); color: var(--text); border: 1px solid var(--border); }
+  #status { min-height: 22px; margin-top: 12px; font-size: 13px; color: var(--muted);
+    white-space: pre-wrap; }
+  #status.err { color: #e05a4e; }
+  .check { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>K8 Control</h1>
+  <p class="sub">Keychron stock-firmware backlight &middot; local only</p>
+
+  <section>
+    <h2>Mode</h2>
+    <div class="modes" id="modes"></div>
+  </section>
+
+  <section>
+    <h2>Color</h2>
+    <div class="row">
+      <label for="color">Color</label>
+      <input type="color" id="color" value="#e0417c">
+      <span class="check"><input type="checkbox" id="random">
+        <label for="random" style="width:auto">random colors</label></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Settings</h2>
+    <div class="row"><label for="brightness">Brightness</label>
+      <input type="range" id="brightness" min="0" max="15" value="15">
+      <output id="brightness-v">15</output></div>
+    <div class="row"><label for="speed">Speed</label>
+      <input type="range" id="speed" min="0" max="15" value="8">
+      <output id="speed-v">8</output></div>
+    <div class="row"><label for="direction">Direction</label>
+      <select id="direction">
+        <option value="lr">left &rarr; right</option>
+        <option value="rl">right &rarr; left</option>
+        <option value="du">down &rarr; up</option>
+        <option value="ud">up &rarr; down</option>
+      </select></div>
+  </section>
+
+  <div class="actions">
+    <button id="apply">Apply</button>
+    <button id="off">Lights off</button>
+  </div>
+  <div id="status"></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let mode = "static";
+const MODES = __MODES__;
+
+const grid = $("modes");
+for (const name of MODES) {
+  if (name === "off") continue;
+  const b = document.createElement("button");
+  b.textContent = name.replaceAll("-", " ");
+  b.dataset.mode = name;
+  if (name === mode) b.classList.add("on");
+  b.onclick = () => {
+    mode = name;
+    grid.querySelectorAll("button").forEach(x => x.classList.toggle("on", x === b));
+  };
+  grid.appendChild(b);
+}
+
+for (const id of ["brightness", "speed"])
+  $(id).oninput = () => $(id + "-v").value = $(id).value;
+
+async function post(path, body) {
+  const st = $("status");
+  st.className = ""; st.textContent = "applying…";
+  try {
+    const r = await fetch(path, {method: "POST", body: JSON.stringify(body || {})});
+    const j = await r.json();
+    st.className = j.ok ? "" : "err";
+    st.textContent = j.ok ? j.message : "error: " + j.message;
+  } catch (e) {
+    st.className = "err"; st.textContent = "error: " + e;
+  }
+}
+
+$("apply").onclick = () => post("/api/set", {
+  mode,
+  color: $("color").value,
+  random: $("random").checked,
+  brightness: +$("brightness").value,
+  speed: +$("speed").value,
+  direction: $("direction").value,
+});
+$("off").onclick = () => post("/api/off");
+</script>
+</body>
+</html>
+"""
+
+
+def run_gui(port, verbose, no_browser=False):
+    import http.server
+    import json
+    import threading
+    import webbrowser
+
+    lock = threading.Lock()
+    page = GUI_HTML.replace("__MODES__", json.dumps(list(MODES)))
+
+    def do_apply(params):
+        mode = params.get("mode", "static")
+        if mode not in MODES:
+            raise RuntimeError(f"unknown mode {mode!r}")
+        color = parse_color(params.get("color", "#ffffff"))
+        brightness = int(params.get("brightness", 15))
+        speed = int(params.get("speed", 8))
+        direction = DIRECTIONS.get(params.get("direction", "lr"), 0)
+        if not (0 <= brightness <= 15 and 0 <= speed <= 15):
+            raise RuntimeError("brightness and speed must be 0-15")
+        with lock:
+            do_set(mode, color, brightness, speed, direction,
+                   bool(params.get("random")), verbose)
+        return f"applied {mode}"
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, code, body, ctype="application/json"):
+            data = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _host_ok(self):
+            host = (self.headers.get("Host") or "").split(":")[0]
+            return host in ("127.0.0.1", "localhost")
+
+        def do_GET(self):
+            if not self._host_ok():
+                return self._send(403, '{"ok": false, "message": "bad host"}')
+            if self.path in ("/", "/index.html"):
+                return self._send(200, page, "text/html")
+            self._send(404, '{"ok": false, "message": "not found"}')
+
+        def do_POST(self):
+            import json as _json
+            if not self._host_ok():
+                return self._send(403, '{"ok": false, "message": "bad host"}')
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                params = _json.loads(self.rfile.read(n) or b"{}")
+                if self.path == "/api/set":
+                    msg = do_apply(params)
+                elif self.path == "/api/off":
+                    with lock:
+                        do_set("off", (0, 0, 0), 0, 0, 0, False, verbose)
+                    msg = "backlight off"
+                else:
+                    return self._send(404, '{"ok": false, "message": "not found"}')
+                self._send(200, _json.dumps({"ok": True, "message": msg}))
+            except Exception as e:
+                self._send(200, _json.dumps({"ok": False, "message": str(e)}))
+
+        def log_message(self, fmt, *args):
+            if verbose:
+                super().log_message(fmt, *args)
+
+    # Fail early with a clear message if the keyboard is unreachable.
+    try:
+        open_keyboard(verbose).close()
+    except RuntimeError as e:
+        sys.exit(str(e))
+
+    url = f"http://127.0.0.1:{port}/"
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        if e.errno == 98:  # EADDRINUSE
+            sys.exit(f"K8 Control is already running — open {url}\n"
+                     f"(or start a second instance with --port <other>)")
+        raise
+    print(f"K8 Control running at {url}  (Ctrl-C to stop)")
+    if not no_browser:
+        threading.Timer(0.3, webbrowser.open, (url,)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nbye")
+
+
+# ----------------------------------------------------------------- CLI ---
+
+def main():
+    epilog = """examples:
+  k8ctl gui                                  web interface on localhost
+  k8ctl probe
+  k8ctl set static --color ff2a00 --brightness 15
+  k8ctl set breathing --color 00ff88 --speed 10
+  k8ctl set spectrum-cycle --speed 15
+  k8ctl set custom --color 2040ff            (uniform per-LED color)
+  k8ctl off
+
+device access without sudo (recommended) - install a udev rule:
+  echo 'KERNEL=="hidraw*", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="0250", TAG+="uaccess"' \\
+    | sudo tee /etc/udev/rules.d/70-keychron-k8.rules
+  sudo udevadm control --reload && replug the keyboard
+  (for a K3 v2 use idProduct "024f")
+"""
+    ap = argparse.ArgumentParser(
+        prog="k8ctl", description=__doc__.splitlines()[0], epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="print raw packets")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("probe", help="read basic info (safe connectivity test)")
+    sub.add_parser("modes", help="list available lighting modes")
+    sub.add_parser("off", help="turn backlight off")
+
+    gp = sub.add_parser("gui", help="start the local web interface")
+    gp.add_argument("--port", type=int, default=8688)
+    gp.add_argument("--no-browser", action="store_true",
+                    help="don't open the browser automatically")
+
+    sp = sub.add_parser("set", help="set mode / color / brightness / speed")
+    sp.add_argument("mode", choices=sorted(MODES))
+    sp.add_argument("--color", type=parse_color, default=(255, 255, 255),
+                    metavar="RRGGBB")
+    sp.add_argument("--random", action="store_true",
+                    help="random colors instead of a fixed color")
+    sp.add_argument("--brightness", type=int, default=15, metavar="0-15")
+    sp.add_argument("--speed", type=int, default=8, metavar="0-15")
+    sp.add_argument("--direction", choices=sorted(DIRECTIONS), default="lr",
+                    help="lr, rl, du (down-up), ud (up-down)")
+
+    args = ap.parse_args()
+
+    if args.command == "modes":
+        for name, value in MODES.items():
+            print(f"{name:28s} {value:#04x}")
+        return
+    if args.command == "gui":
+        return run_gui(args.port, args.verbose, args.no_browser)
+
+    try:
+        if args.command == "probe":
+            kb = open_keyboard(args.verbose)
+            try:
+                resp = kb.cmd(CMD_INFO)
+                print(f"device responded on {kb.path}: {resp[:24].hex(' ')}")
+                print("Looks alive. Feature-report channel works.")
+            finally:
+                kb.close()
+        elif args.command == "off":
+            do_set("off", (0, 0, 0), 0, 0, 0, False, args.verbose)
+            print("backlight off")
+        else:
+            for v in (args.brightness, args.speed):
+                if not 0 <= v <= 15:
+                    sys.exit("brightness and speed must be 0-15")
+            do_set(args.mode, args.color, args.brightness, args.speed,
+                   DIRECTIONS[args.direction], args.random, args.verbose)
+            print(f"applied: {args.mode}"
+                  + ("" if args.random else " #%02x%02x%02x" % args.color)
+                  + f" brightness={args.brightness} speed={args.speed}")
+    except RuntimeError as e:
+        sys.exit(str(e))
+
+
+if __name__ == "__main__":
+    main()
